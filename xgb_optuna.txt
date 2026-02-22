@@ -1,0 +1,139 @@
+# -----------------------------
+# Imports
+# -----------------------------
+import numpy as np
+import xgboost as xgb
+import optuna
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import log_loss
+ 
+# -----------------------------
+# 1. Convert to NumPy
+# -----------------------------
+X_train_post_vif_np = X_train_post_vif.values
+y_train_np = y_train.values
+X_test_post_vif_np  = X_test_post_vif.values
+y_test_np  = y_test.values
+ 
+# -----------------------------
+# 2. Stratified K-Fold
+# -----------------------------
+skf = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=42
+)
+ 
+# -----------------------------
+# 3. Optuna Objective Function
+# -----------------------------
+def objective(trial):
+ 
+    params = {
+        "objective": "multi:softprob",
+        "num_class": 3,
+        "eval_metric": "mlogloss",
+        "tree_method": "hist",
+ 
+        # ---- Learning control
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.08),
+ 
+        # ---- Structural regularization
+        "max_depth": trial.suggest_int("max_depth", 2, 4),
+        "min_child_weight": trial.suggest_int("min_child_weight", 10, 50),
+        "gamma": trial.suggest_float("gamma", 0.5, 2.0),
+ 
+        # ---- Stochastic regularization
+        "subsample": trial.suggest_float("subsample", 0.6, 0.8),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.8),
+ 
+        # ---- Explicit regularization
+        "alpha": trial.suggest_float("alpha", 0.0, 5.0),
+        "lambda": trial.suggest_float("lambda", 1.0, 10.0),
+ 
+        "nthread": -1,
+        "random_state": 42
+    }
+ 
+    fold_losses = []
+    best_iters  = []   # <<< NEW
+ 
+    for tr_idx, val_idx in skf.split(X_train_post_vif_np, y_train_np):
+ 
+        dtrain = xgb.DMatrix(
+            X_train_post_vif_np[tr_idx],
+            label=y_train_np[tr_idx]
+        )
+        dval = xgb.DMatrix(
+            X_train_post_vif_np[val_idx],
+            label=y_train_np[val_idx]
+        )
+ 
+        model = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=2000,
+            evals=[(dval, "val")],
+            early_stopping_rounds=30,
+            verbose_eval=False
+        )
+ 
+        # ---- CV metrics
+        y_val_proba = model.predict(dval)
+        fold_losses.append(log_loss(y_train_np[val_idx], y_val_proba))
+ 
+        # ---- Capture best iteration
+        best_iters.append(model.best_iteration)
+ 
+    # ---- Store best iteration for final training
+    trial.set_user_attr("best_iteration", int(np.mean(best_iters)))
+ 
+    return np.mean(fold_losses)
+ 
+# -----------------------------
+# 4. Run Optuna Study
+# -----------------------------
+study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(seed=42)
+)
+ 
+study.optimize(
+    objective,
+    n_trials=50,
+    show_progress_bar=True
+)
+ 
+# -----------------------------
+# 5. Best parameters
+# -----------------------------
+print("\n✅ Best CV LogLoss:", study.best_value)
+print("✅ Best Params:")
+for k, v in study.best_params.items():
+    print(f"  {k}: {v}")
+ 
+# ---- Best number of trees from CV
+best_n_rounds = study.best_trial.user_attrs["best_iteration"]
+print("✅ Best num_boost_round (CV avg):", best_n_rounds)
+ 
+# -----------------------------
+# 6. Train FINAL model on FULL data
+# -----------------------------
+dtrain_full = xgb.DMatrix(X_train_post_vif_np, label=y_train_np)
+dtest = xgb.DMatrix(X_test_post_vif_np)
+ 
+final_params = {
+    "objective": "multi:softprob",
+    "num_class": 3,
+    "eval_metric": "mlogloss",
+    "tree_method": "hist",
+    "nthread": -1,
+    "random_state": 42,
+    **study.best_params
+}
+ 
+xgb_tuned = xgb.train(
+    params=final_params,
+    dtrain=dtrain_full,
+    num_boost_round=best_n_rounds   # <<< FIX
+)
